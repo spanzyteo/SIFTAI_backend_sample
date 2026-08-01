@@ -14,14 +14,25 @@ class VectorStoreProtocol(Protocol):
 
     async def upsert_chunks(self, chunks: list[str], metadata: list[dict[str, Any]]) -> None: ...
 
-    async def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]: ...
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        predicates: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]: ...
 
     async def delete_document(self, document_id: str) -> None: ...
 
 
 @dataclass
 class VectorStoreService:
-    """A lightweight local vector-store shim for fallback development."""
+    """A lightweight local vector-store shim for fallback development.
+
+    This is a naive token-overlap "search" used only when Ahnlich is
+    unreachable (e.g. running the API without Docker). It intentionally
+    mirrors the public interface of AhnlichVectorStoreService, including
+    predicate filtering, so callers never need to know which one is active.
+    """
 
     _entries: list[dict[str, Any]] = field(default_factory=list)
 
@@ -35,13 +46,23 @@ class VectorStoreService:
         for chunk, item_metadata in zip(chunks, metadata, strict=True):
             self._entries.append({"text": chunk, "metadata": item_metadata, "score": 0.0})
 
-    async def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        predicates: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         query_tokens = set(query.lower().split())
         if not query_tokens:
             return []
 
         scored_entries = []
         for entry in self._entries:
+            if predicates and any(
+                str(entry["metadata"].get(key)) != str(value) for key, value in predicates.items()
+            ):
+                continue
+
             entry_tokens = set(entry["text"].lower().split())
             overlap = len(query_tokens & entry_tokens)
             if overlap:
@@ -59,31 +80,28 @@ class VectorStoreService:
 
 
 def _to_ahnlich_metadata_value(val: Any, metadata_module: Any) -> Any:
-    """Utility to map standard Python types to Ahnlich MetadataValue protobuf wrappers."""
+    """Map a Python value to an Ahnlich MetadataValue.
+
+    IMPORTANT: the ahnlich_client_py `MetadataValue` protobuf message only
+    defines `raw_string`, `image`, and `audio` fields (verified against the
+    installed ahnlich-client-py package - there is no raw_integer/raw_boolean/
+    raw_float variant). Passing a Python int/bool/float as a keyword to
+    MetadataValue(...) raises TypeError. Every metadata value we store
+    therefore has to be stringified first; pydantic coerces numeric strings
+    back to int/float on the way out (see ChunkMetadata.page_number).
+    """
     if isinstance(val, bool):
-        return metadata_module.MetadataValue(raw_boolean=val)
-    elif isinstance(val, int):
-        return metadata_module.MetadataValue(raw_integer=val)
-    elif isinstance(val, float):
-        return metadata_module.MetadataValue(raw_float=val)
-    else:
-        return metadata_module.MetadataValue(raw_string=str(val))
+        return metadata_module.MetadataValue(raw_string="true" if val else "false")
+    return metadata_module.MetadataValue(raw_string=str(val))
 
 
 def _extract_metadata_value(value: Any) -> Any:
-    """Extract primitive Python values safely from Ahnlich metadata wrappers."""
+    """Extract the primitive string stored inside an Ahnlich MetadataValue."""
     if value is None:
         return None
 
-    # Handle betterproto / protobuf oneof inspection safely
-    if hasattr(value, "raw_string") and value.raw_string:
+    if hasattr(value, "raw_string"):
         return value.raw_string
-    if hasattr(value, "raw_integer") and value.raw_integer is not None and value.raw_integer != 0:
-        return value.raw_integer
-    if hasattr(value, "raw_boolean") and value.raw_boolean is not None:
-        return value.raw_boolean
-    if hasattr(value, "raw_float") and value.raw_float is not None and value.raw_float != 0.0:
-        return value.raw_float
 
     if hasattr(value, "value"):
         inner = getattr(value, "value")
@@ -94,9 +112,31 @@ def _extract_metadata_value(value: Any) -> Any:
     return str(value)
 
 
+def _build_predicate_condition(predicates: dict[str, str], predicates_module: Any, metadata_module: Any) -> Any:
+    """Combine one or more equality predicates into a single PredicateCondition using AND."""
+    conditions = [
+        predicates_module.PredicateCondition(
+            value=predicates_module.Predicate(
+                equals=predicates_module.Equals(
+                    key=key,
+                    value=metadata_module.MetadataValue(raw_string=str(val)),
+                )
+            )
+        )
+        for key, val in predicates.items()
+    ]
+
+    condition = conditions[0]
+    for extra in conditions[1:]:
+        condition = predicates_module.PredicateCondition(
+            and_=predicates_module.AndCondition(left=condition, right=extra)
+        )
+    return condition
+
+
 @dataclass
 class AhnlichVectorStoreService:
-    """Ahnlich AI-backed vector store implementation using gRPC client."""
+    """Ahnlich AI-backed vector store implementation using the gRPC client."""
 
     _endpoint: str | None = None
     _host: str | None = None
@@ -174,6 +214,7 @@ class AhnlichVectorStoreService:
                             store_original=True,
                         )
                     )
+                self._clear_last_error()
         except Exception as exc:
             self._set_last_error(exc)
             await self._fallback.initialize()
@@ -216,7 +257,7 @@ class AhnlichVectorStoreService:
                             value=keyval.StoreValue(value=metadata_value),
                         )
                     )
-                
+
                 await client.set(
                     ai_query.Set(
                         store=self._store_name,
@@ -229,9 +270,14 @@ class AhnlichVectorStoreService:
             self._set_last_error(exc)
             await self._fallback.upsert_chunks(chunks, metadata)
 
-    async def search(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        predicates: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         if not self._has_connection_target():
-            return await self._fallback.search(query=query, top_k=top_k)
+            return await self._fallback.search(query=query, top_k=top_k, predicates=predicates)
 
         try:
             from grpclib.client import Channel
@@ -239,10 +285,14 @@ class AhnlichVectorStoreService:
             from ahnlich_client_py.grpc.ai import query as ai_query
             from ahnlich_client_py.grpc.ai.preprocess import PreprocessAction
             from ahnlich_client_py.grpc.algorithm.algorithms import Algorithm
-            from ahnlich_client_py.grpc import keyval
+            from ahnlich_client_py.grpc import keyval, predicates as predicates_module, metadata as metadata_module
         except ImportError as exc:
             self._set_last_error(exc)
-            return await self._fallback.search(query=query, top_k=top_k)
+            return await self._fallback.search(query=query, top_k=top_k, predicates=predicates)
+
+        condition = (
+            _build_predicate_condition(predicates, predicates_module, metadata_module) if predicates else None
+        )
 
         host, port = self._connection_settings()
         try:
@@ -255,6 +305,7 @@ class AhnlichVectorStoreService:
                         closest_n=top_k,
                         algorithm=Algorithm.CosineSimilarity,
                         preprocess_action=PreprocessAction.ModelPreprocessing,
+                        condition=condition,
                     )
                 )
                 self._clear_last_error()
@@ -262,24 +313,27 @@ class AhnlichVectorStoreService:
                 results = []
                 for entry in response.entries:
                     extracted_meta = _extract_metadata_value(entry.value)
-                    
-                    # Resolve raw string from StoreInput
+
                     chunk_text = ""
-                    if hasattr(entry.key, "raw_string") and entry.key.raw_string:
+                    if entry.key is not None and hasattr(entry.key, "raw_string"):
                         chunk_text = entry.key.raw_string
-                    elif hasattr(entry, "key") and isinstance(entry.key, str):
-                        chunk_text = entry.key
+
+                    # NOTE: GetSimNEntry has a `similarity` field (a Similarity
+                    # message with a `.value` float), not a bare `.score`
+                    # attribute. Reading `.score` here always silently
+                    # returned 0.0 for every result.
+                    score = float(entry.similarity.value) if entry.similarity is not None else 0.0
 
                     results.append({
                         "text": chunk_text,
                         "metadata": extracted_meta if isinstance(extracted_meta, dict) else {},
-                        "score": float(entry.score) if hasattr(entry, "score") else 0.0,
+                        "score": score,
                     })
 
                 return results
         except Exception as exc:
             self._set_last_error(exc)
-            return await self._fallback.search(query=query, top_k=top_k)
+            return await self._fallback.search(query=query, top_k=top_k, predicates=predicates)
 
     async def delete_document(self, document_id: str) -> None:
         if not self._has_connection_target():
@@ -290,14 +344,14 @@ class AhnlichVectorStoreService:
             from grpclib.client import Channel
             from ahnlich_client_py.grpc.services.ai_service import AiServiceStub
             from ahnlich_client_py.grpc.ai import query as ai_query
-            from ahnlich_client_py.grpc import predicates, metadata as metadata_module
+            from ahnlich_client_py.grpc import predicates as predicates_module, metadata as metadata_module
         except ImportError:
             await self._fallback.delete_document(document_id)
             return
 
-        condition = predicates.PredicateCondition(
-            value=predicates.Predicate(
-                equals=predicates.Equals(
+        condition = predicates_module.PredicateCondition(
+            value=predicates_module.Predicate(
+                equals=predicates_module.Equals(
                     key="document_id",
                     value=metadata_module.MetadataValue(raw_string=document_id),
                 )
@@ -308,15 +362,10 @@ class AhnlichVectorStoreService:
         try:
             async with Channel(host=host, port=port) as channel:
                 client = AiServiceStub(channel)
-                response = await client.get_pred(
-                    ai_query.GetPred(
-                        store=self._store_name,
-                        condition=condition,
-                    )
-                )
-                if response.entries:
-                    keys_to_delete = [entry.key for entry in response.entries]
-                    await client.del_key(ai_query.DelKey(store=self._store_name, keys=keys_to_delete))
+                # del_pred deletes every entry matching the predicate in a
+                # single round trip - no need to get_pred + del_key.
+                await client.del_pred(ai_query.DelPred(store=self._store_name, condition=condition))
+                self._clear_last_error()
         except Exception as exc:
             self._set_last_error(exc)
             await self._fallback.delete_document(document_id)
