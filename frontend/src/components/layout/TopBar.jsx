@@ -1,54 +1,61 @@
-import {
-    FileText,
-    ShieldCheck,
-} from "lucide-react";
+import { FileSearch2, PanelLeftOpen } from "lucide-react";
 
 import ThemeToggle from "../theme/ThemeToggle";
-import Button from "../ui/Button";
 import ModeDropdown from "../theme/ModeDropdown";
+import Button from "../ui/Button";
 
-function TopBar() {
-    return (
-        <header className="sticky top-0 z-50 border-b border-border bg-surface/80 backdrop-blur-xl">
-            <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
+import { useAuth } from "@clerk/react";
+import { useAuth as useLocalAuth } from "../../../store/auth";
 
-                <div className="flex items-center gap-3">
+function TopBar({ sidebarOpen, onToggleSidebar }) {
+  const { isLoaded, isSignedIn } = useAuth();
+  const openWelcome = useLocalAuth((state) => state.openWelcome);
 
-                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-primary text-white">
-                        <FileText size={20} />
-                    </div>
+  return (
+    <header className="sticky top-0 z-30 border-b border-border bg-surface/80 backdrop-blur-xl">
+      <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-3 sm:px-6 lg:px-8">
+        {/* Left side - Sidebar toggle at the edge */}
+        <div className="flex items-center gap-4 sm:gap-6">
+          {!sidebarOpen && (
+            <button
+              type="button"
+              onClick={onToggleSidebar}
+              className="flex h-10 w-10 items-center justify-center rounded-xl border border-border bg-background text-text transition-all duration-200 hover:bg-primary/10 hover:border-primary active:scale-95"
+              aria-label="Open sidebar"
+              title="Open sidebar"
+            >
+              <PanelLeftOpen size={20} />
+            </button>
+          )}
 
-                    <div>
-                        <h1 className="text-lg font-semibold">
-                            Sift AI
-                        </h1>
-
-                        <p className="text-xs text-textMuted">
-                            Research Assistant
-                        </p>
-                    </div>
-
-                </div>
-
-                <div className="flex items-center gap-3">
-
-                    {/* <Button
-                        variant="secondary"
-                        className="hidden sm:flex gap-2"
-                    >
-                        <ShieldCheck size={18} />
-                        STRICT
-                    </Button> */}
-
-                    <ModeDropdown />
-
-                    <ThemeToggle />
-
-                </div>
-
+          {/* Logo and branding */}
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded-2xl bg-primary text-textInverse shadow-lg shadow-primary/20 transition-transform hover:scale-105">
+              <FileSearch2 size={22} />
             </div>
-        </header>
-    );
+
+            <div className="hidden sm:block">
+              <h1 className="text-lg font-semibold text-text">Sift AI</h1>
+              <p className="text-xs text-textMuted">AI Research Assistant</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Right side - Controls */}
+        <div className="flex items-center gap-2 sm:gap-3">
+          <ModeDropdown />
+
+          {isLoaded && !isSignedIn && (
+            <Button variant="secondary" onClick={openWelcome} className="text-sm sm:text-base">
+              Sign In
+            </Button>
+          )}
+
+          <ThemeToggle />
+        </div>
+      </div>
+    </header>
+  );
 }
 
 export default TopBar;
